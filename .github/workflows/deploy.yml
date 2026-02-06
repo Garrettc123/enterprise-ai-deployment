@@ -1,0 +1,234 @@
+name: Deploy Enterprise AI Grid
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  TERRAFORM_VERSION: 1.6.0
+  KUBECTL_VERSION: 1.28.0
+
+jobs:
+  validate:
+    name: Validate Infrastructure
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Format Check
+        run: |
+          cd terraform
+          terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: |
+          cd terraform/environments/production
+          terraform init -backend=false
+
+      - name: Terraform Validate
+        run: |
+          cd terraform/environments/production
+          terraform validate
+
+      - name: Validate Kubernetes Manifests
+        run: |
+          kubectl --dry-run=client apply -f kubernetes/
+
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  build:
+    name: Build Docker Images
+    runs-on: ubuntu-latest
+    needs: [validate, security-scan]
+    if: github.event_name == 'push'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push API Gateway
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/api-gateway
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/api-gateway:latest
+            ghcr.io/${{ github.repository }}/api-gateway:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push Processor Service
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/processor
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/processor:latest
+            ghcr.io/${{ github.repository }}/processor:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push ML Inference Service
+        uses: docker/build-push-action@v5
+        with:
+          context: ./services/ml-inference
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}/ml-inference:latest
+            ghcr.io/${{ github.repository }}/ml-inference:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  terraform:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform Init
+        run: |
+          cd terraform/environments/production
+          terraform init
+
+      - name: Terraform Plan
+        run: |
+          cd terraform/environments/production
+          terraform plan -out=tfplan
+
+      - name: Terraform Apply
+        run: |
+          cd terraform/environments/production
+          terraform apply -auto-approve tfplan
+
+      - name: Save Terraform Outputs
+        run: |
+          cd terraform/environments/production
+          terraform output -json > outputs.json
+
+      - name: Upload Terraform Outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-outputs
+          path: terraform/environments/production/outputs.json
+
+  deploy-k8s:
+    name: Deploy to Kubernetes
+    runs-on: ubuntu-latest
+    needs: [terraform]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Download Terraform Outputs
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-outputs
+          path: ./
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name enterprise-ai-grid --region ${{ env.AWS_REGION }}
+
+      - name: Deploy Base Resources
+        run: |
+          kubectl apply -f kubernetes/base/
+
+      - name: Deploy Applications
+        run: |
+          kubectl set image deployment/api-gateway api-gateway=ghcr.io/${{ github.repository }}/api-gateway:${{ github.sha }} -n enterprise-ai-grid
+          kubectl set image deployment/processor processor=ghcr.io/${{ github.repository }}/processor:${{ github.sha }} -n enterprise-ai-grid
+          kubectl set image deployment/ml-inference ml-inference=ghcr.io/${{ github.repository }}/ml-inference:${{ github.sha }} -n enterprise-ai-grid
+
+      - name: Wait for Rollout
+        run: |
+          kubectl rollout status deployment/api-gateway -n enterprise-ai-grid --timeout=10m
+          kubectl rollout status deployment/processor -n enterprise-ai-grid --timeout=10m
+          kubectl rollout status deployment/ml-inference -n enterprise-ai-grid --timeout=10m
+
+      - name: Deploy Monitoring Stack
+        run: |
+          kubectl apply -f kubernetes/monitoring/
+
+      - name: Health Check
+        run: |
+          kubectl get pods -n enterprise-ai-grid
+          kubectl get svc -n enterprise-ai-grid
+
+  post-deploy:
+    name: Post-Deployment Tasks
+    runs-on: ubuntu-latest
+    needs: [deploy-k8s]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Run Integration Tests
+        run: |
+          echo "Running integration tests..."
+          # Add your integration test commands here
+
+      - name: Notify Deployment Success
+        run: |
+          echo "✅ Deployment completed successfully!"
+          echo "Dashboard: https://dashboard.enterprise-ai-grid.com"
+          echo "API: https://api.enterprise-ai-grid.com"
